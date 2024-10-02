@@ -58,6 +58,28 @@
 #include <inttypes.h>
 #include <stdlib.h>
 
+#include "cy_eth_phy_driver.h"
+
+/* Ethernet interface ID */
+#ifdef XMC7100D_F176K4160
+#define INTERFACE_ID                        CY_ECM_INTERFACE_ETH0
+#else
+#define INTERFACE_ID                        CY_ECM_INTERFACE_ETH1
+#endif
+
+cy_ecm_phy_callbacks_t phy_callbacks =
+{
+        .phy_init = cy_eth_phy_init,
+        .phy_configure = cy_eth_phy_configure,
+        .phy_enable_ext_reg = cy_eth_phy_enable_ext_reg,
+        .phy_discover = cy_eth_phy_discover,
+        .phy_get_auto_neg_status = cy_eth_phy_get_auto_neg_status,
+        .phy_get_link_partner_cap = cy_eth_phy_get_link_partner_cap,
+        .phy_get_linkspeed = cy_eth_phy_get_linkspeed,
+        .phy_get_linkstatus = cy_eth_phy_get_linkstatus,
+        .phy_reset = cy_eth_phy_reset
+};
+
 /*******************************************************************************
  * Macros
  ********************************************************************************/
@@ -77,14 +99,11 @@ cy_rslt_t connect_to_ethernet (ip_config_t ip_config)
    uint8_t retry_count = 0;
 
    /* Variables used by Ethernet connection manager.*/
-   cy_ecm_phy_config_t ecm_phy_config;
    cy_ecm_ip_address_t ip_addr;
-   cy_ecm_mac_t mac_address = {0};
-   cy_ecm_mac_t * p_mac_address = NULL;
+   //cy_ecm_mac_t mac_address = {0};
+   //cy_ecm_mac_t * p_mac_address = NULL;
 
-   ecm_phy_config.interface_speed_type = CY_ECM_SPEED_TYPE_RGMII;
-   ecm_phy_config.mode = CY_ECM_DUPLEX_AUTO;
-   ecm_phy_config.phy_speed = CY_ECM_PHY_SPEED_AUTO;
+
 
    /* Initialize ethernet connection manager. */
    result = cy_ecm_init();
@@ -103,10 +122,10 @@ cy_rslt_t connect_to_ethernet (ip_config_t ip_config)
 
    printf ("IP: %s\n", (ip_config == IP_CONFIG_STATIC) ? "Static" : "Dynamic");
 
+   /*
    read_mac_from_file (&mac_address);
    if (memcmp (mac_address, "\x00\x00\x00\x00\x00\x00", 6) == 0)
    {
-      p_mac_address = NULL;
       printf ("MAC: 00:03:19:45:00:00 (default)\n");
    }
    else
@@ -121,12 +140,10 @@ cy_rslt_t connect_to_ethernet (ip_config_t ip_config)
          mac_address[4],
          mac_address[5]);
    }
+   */
 
-   result = cy_ecm_ethif_init (
-      CY_ECM_INTERFACE_ETH1,
-      p_mac_address,
-      &ecm_phy_config,
-      &ecm_handle);
+   /* Initialize the Ethernet Interface and PHY driver */
+   result =  cy_ecm_ethif_init(INTERFACE_ID, &phy_callbacks, &ecm_handle);
    if (result != CY_RSLT_SUCCESS)
    {
       printf (

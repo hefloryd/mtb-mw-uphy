@@ -43,23 +43,13 @@
 #include "cy_ecm.h"
 #include "cy_ecm_error.h"
 
-/*******************************************************************************
- * Macros
- ********************************************************************************/
-
-#define MAKE_IPV4_ADDRESS(a, b, c, d)                                          \
-   ((((uint32_t)d) << 24) | (((uint32_t)c) << 16) | (((uint32_t)b) << 8) |     \
-    ((uint32_t)a))
-
-#define APP_STATIC_IP_ADDR MAKE_IPV4_ADDRESS (0, 0, 0, 0)
-#define APP_NETMASK        MAKE_IPV4_ADDRESS (255, 255, 255, 0)
-#define APP_STATIC_GATEWAY MAKE_IPV4_ADDRESS (0, 0, 0, 0)
-
-typedef enum
-{
-   IP_CONFIG_DYNAMIC = 0,
-   IP_CONFIG_STATIC
-} ip_config_t;
+extern uint32_t db_get_network_ipaddr (void);
+extern uint32_t db_get_network_netmask (void);
+extern uint32_t db_get_network_gateway (void);
+extern uint32_t db_get_network_nameserver (void);
+extern bool db_get_network_dhcp (void);
+extern const char * db_get_network_hostname (void);
+extern void db_load (const char * filename);
 
 /*******************************************************************************
  * Function Prototypes
@@ -73,7 +63,7 @@ typedef enum
  * @param ip_config IP configuration type
  * @return CY_RSLT_SUCCESS if successful, error code otherwise
  */
-cy_rslt_t connect_to_ethernet (ip_config_t config);
+cy_rslt_t connect_to_ethernet (void);
 
 #endif /* NETWORK_H_ */
 

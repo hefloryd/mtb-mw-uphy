@@ -2,7 +2,6 @@
  * File Name:   network.c
  *
  * Description: Ethernet initialization.
- *              Based on udp_server example.
  *
  ********************************************************************************
  * Copyright 2022, Cypress Semiconductor Corporation (an Infineon company) or
@@ -37,42 +36,36 @@
  * so agrees to indemnify Cypress against all liability.
  *******************************************************************************/
 
-/* Header file includes */
-#include "cyhal.h"
-#include "cybsp.h"
-#include "cy_retarget_io.h"
-
-/* FreeRTOS header file */
-#include <FreeRTOS.h>
-#include <task.h>
-
-/* Ethernet connection manager header files */
-#include "cy_ecm.h"
-#include "cy_ecm_error.h"
+/* The Infineon Ethernet Connection Manager does not work well for a
+ * target that needs runtime configurable IP settings. It also does
+ * not work well for a link that could go up and down at runtime.
+ *
+ * By using the lower-level Network Interface integration module
+ * instead, we can support link changes as we would normally
+ * expect. We still use Ethernet Connection Manager for bringing up
+ * the Ethernet driver, and that unfortunately requires an established
+ * link to complete.
+ */
 
 #include "network.h"
 #include "shell.h"
-#include "rte_fs.h"
+#include "cycfg.h"
+
+/* Ethernet connection manager header files */
+#include "cy_ecm.h"
+
+/* Network interface integration header files */
+#include "cy_network_mw_core.h"
+
+/* Ethernet PHY driver header files */
+#include "cy_eth_phy_driver.h"
+
+#include "lwip/netif.h"
+#include "lwip/dns.h"
 
 /* Standard C header files */
 #include <inttypes.h>
-#include <stdlib.h>
-#include <string.h>
 #include <stdio.h>
-
-#include <lwip/netif.h>
-#include "lwip/ip_addr.h"
-#include "lwip/sockets.h"
-#include "lwip/dhcp.h"
-
-#include "shell.h"
-
-#include "cy_eth_phy_driver.h"
-
-void db_load (const char * filename);
-uint32_t db_get_network_ipaddr (void);
-uint32_t db_get_network_netmask (void);
-uint32_t db_get_network_gateway (void);
 
 /* Ethernet interface ID */
 #ifdef XMC7100D_F176K4160
@@ -81,7 +74,7 @@ uint32_t db_get_network_gateway (void);
 #define INTERFACE_ID CY_ECM_INTERFACE_ETH1
 #endif
 
-cy_ecm_phy_callbacks_t phy_callbacks = {
+static cy_ecm_phy_callbacks_t phy_callbacks = {
    .phy_init = cy_eth_phy_init,
    .phy_configure = cy_eth_phy_configure,
    .phy_enable_ext_reg = cy_eth_phy_enable_ext_reg,
@@ -92,131 +85,10 @@ cy_ecm_phy_callbacks_t phy_callbacks = {
    .phy_get_linkstatus = cy_eth_phy_get_linkstatus,
    .phy_reset = cy_eth_phy_reset};
 
-/* variable used to maintain hostname in lwip */
-static char net_hostname[64];
-
-/*******************************************************************************
- * Macros
- ********************************************************************************/
-
-/*
- * In ECM v2.1.0 the option of configuring static IP address in runtime was
- * removed Furthermore, when supplying a static ip address to the
- * cy_ecm_connect() function this is overridden by settings configured in device
- * configurator tool
- *
- * Out of the box, u-phy needs to configure either DHCP or static ip depending
- * on which protocol is active. Hence we have added a workaround which
- * re-configures the network via LWIP once ECM connection is setup. This will be
- * removed once the ECM issues have been addressed.
- */
-
-#define ECM2_1_WORKAROUND
-
-/* Maximum number of connection retries to the ethernet network */
-#define MAX_ETH_RETRY_COUNT (3u)
-
-/* static void read_mac_from_file (cy_ecm_mac_t * mac_address); */
-
-const char * mac_file = STORAGE_ROOT "mac";
-
 static cy_ecm_t ecm_handle = NULL;
+static cy_network_interface_context *iface;
 
-static void dhcp_set (struct netif * netif, bool enable)
-{
-   if (enable)
-   {
-      dhcp_start (netif);
-   }
-   else
-   {
-      dhcp_stop (netif);
-      dhcp_cleanup (netif);
-      netif_set_down (netif);
-      netif_set_up (netif);
-   }
-}
-
-int dhcp_is_enabled (struct netif * netif)
-{
-   struct dhcp * dhcp_data = netif_dhcp_data (netif);
-   return (dhcp_data != NULL) ? 1 : 0;
-}
-
-#ifdef ECM2_1_WORKAROUND
-
-void ecm_workaround (ip_config_t ip_config)
-{
-   /* re-apply network settings depending on active fieldbus protocol */
-   if (ip_config == IP_CONFIG_STATIC)
-   {
-      cy_ecm_ip_setting_t static_ip_addr;
-      static_ip_addr.ip_address.version = CY_ECM_IP_VER_V4;
-      static_ip_addr.ip_address.ip.v4 = db_get_network_ipaddr();
-      static_ip_addr.gateway.version = CY_ECM_IP_VER_V4;
-      static_ip_addr.gateway.ip.v4 = db_get_network_gateway();
-      static_ip_addr.netmask.version = CY_ECM_IP_VER_V4;
-      static_ip_addr.netmask.ip.v4 = db_get_network_netmask();
-
-      dhcp_set (netif_default, false);
-
-      netif_set_addr (
-         netif_default,
-         (const ip4_addr_t *)&static_ip_addr.ip_address.ip.v4,
-         (const ip4_addr_t *)&static_ip_addr.netmask.ip.v4,
-         (const ip4_addr_t *)&static_ip_addr.gateway.ip.v4);
-   }
-   else
-   {
-      /* enable dhcp */
-      dhcp_set (netif_default, true);
-   }
-}
-#endif
-
-void sync_db(void)
-{
-	cy_ecm_ip_address_t ipaddr;
-	cy_ecm_ip_address_t netmask;
-	cy_ecm_ip_address_t gateway;
-	char cfg[64];
-
-	if (!ecm_handle)
-		return;
-
-	/* fetch network info */
-	cy_ecm_get_ip_address(ecm_handle, &ipaddr);
-	cy_ecm_get_netmask_address(ecm_handle, &netmask);
-	cy_ecm_get_gateway_address(ecm_handle, &gateway);
-
-	sprintf(cfg, "ip_set ipaddr=%s", ipaddr_ntoa ((const ip_addr_t *) &ipaddr.ip.v4));
-    rte_shell_execute(cfg);
-
-	sprintf(cfg, "ip_set netmask=%s", ipaddr_ntoa ((const ip_addr_t *) &netmask.ip.v4));
-    rte_shell_execute(cfg);
-
-	sprintf(cfg, "ip_set gateway=%s", ipaddr_ntoa ((const ip_addr_t *)&gateway.ip.v4));
-    rte_shell_execute(cfg);
-
-    if (dhcp_is_enabled (netif_default))
-    {
-        sprintf(cfg, "ip_set dhcp=true");
-        rte_shell_execute(cfg);
-    }
-    else
-    {
-        sprintf(cfg, "ip_set dhcp=false");
-        rte_shell_execute(cfg);
-    }
-}
-
-/*
- * multiple events from lwip stack with same info
- * maintain copy and only print when modified
- */
-static cy_ecm_event_data_t prev_evt_data = {0};
-
-static void ethernet_event_callback (
+static void ecm_link_cb (
    cy_ecm_event_t event,
    cy_ecm_event_data_t * event_data)
 {
@@ -224,41 +96,26 @@ static void ethernet_event_callback (
    {
    case CY_ECM_EVENT_CONNECTED:
       printf ("Ethernet connected.\n");
+      cy_network_ip_up (iface);
       break;
    case CY_ECM_EVENT_DISCONNECTED:
       printf ("Ethernet disconnected.\n");
+      cy_network_ip_down (iface);
       break;
-   case CY_ECM_EVENT_IP_CHANGED:
-   {
-      cy_ecm_event_data_t * prev_evt = &prev_evt_data;
-
-      if (memcmp (prev_evt, event_data, sizeof (cy_ecm_event_data_t)) == 0)
-         return;
-
-      memcpy (prev_evt, event_data, sizeof (cy_ecm_event_data_t));
-
-      /* only handle valid addresses */
-      if (event_data->ip_addr.ip.v4 != 0)
-      {
-          printf (
-             "IP address changed : %s\n",
-             ipaddr_ntoa ((const ip_addr_t *)&event_data->ip_addr.ip.v4));
-          sync_db();
-      }
-   }
-   break;
    default:
       break;
    }
 }
 
-cy_rslt_t connect_to_ethernet (ip_config_t ip_config)
+static void iface_status_cb (cy_network_interface_context *iface, void *user_data)
+{
+}
+
+cy_rslt_t connect_to_ethernet (void)
 {
    cy_rslt_t result = CY_RSLT_SUCCESS;
-   uint8_t retry_count = 0;
-
-   /* Variables used by Ethernet connection manager.*/
-   cy_ecm_ip_address_t ip_addr;
+   uint8_t mac_address[6] = { 0 };
+   cy_network_static_ip_addr_t ip_addr;
 
    /* Initialize ethernet connection manager. */
    result = cy_ecm_init();
@@ -275,8 +132,6 @@ cy_rslt_t connect_to_ethernet (ip_config_t ip_config)
       printf ("Ethernet connection manager initialized.\n");
    }
 
-   printf ("IP: %s\n", (ip_config == IP_CONFIG_STATIC) ? "Static" : "Dynamic");
-
    /* Initialize the Ethernet Interface and PHY driver */
    result = cy_ecm_ethif_init (INTERFACE_ID, &phy_callbacks, &ecm_handle);
    if (result != CY_RSLT_SUCCESS)
@@ -289,377 +144,60 @@ cy_rslt_t connect_to_ethernet (ip_config_t ip_config)
       CY_ASSERT (0);
    }
 
-   result = cy_ecm_register_event_callback (ecm_handle, ethernet_event_callback);
-
-   /* Establish a connection to the ethernet network */
-   while (1)
+   if (INTERFACE_ID == CY_ECM_INTERFACE_ETH0)
    {
-      if (ip_config == IP_CONFIG_STATIC)
-      {
-         cy_ecm_ip_setting_t static_ip_addr;
-
-         db_load ("INFO");
-         static_ip_addr.ip_address.version = CY_ECM_IP_VER_V4;
-         static_ip_addr.ip_address.ip.v4 = db_get_network_ipaddr();
-         static_ip_addr.gateway.version = CY_ECM_IP_VER_V4;
-         static_ip_addr.gateway.ip.v4 = db_get_network_gateway();
-         static_ip_addr.netmask.version = CY_ECM_IP_VER_V4;
-         static_ip_addr.netmask.ip.v4 = db_get_network_netmask();
-
-         result = cy_ecm_connect (ecm_handle, &static_ip_addr, &ip_addr);
-      }
-      else
-      {
-         result = cy_ecm_connect (ecm_handle, NULL, &ip_addr);
-      }
-
-      if (result != CY_RSLT_SUCCESS)
-      {
-         retry_count++;
-         if (retry_count >= MAX_ETH_RETRY_COUNT)
-         {
-            printf ("Exceeded max ethernet connection attempts\n");
-            return result;
-         }
-         printf ("Connection to ethernet network failed. Retrying...\n");
-         continue;
-      }
-      else
-      {
-#ifdef ECM2_1_WORKAROUND
-         ecm_workaround (ip_config);
+#if (defined (eth_0_ENABLED) && (eth_0_ENABLED == 1u))
+      mac_address[0] = (uint8_t)eth_0_MAC_ADDR0;
+      mac_address[1] = (uint8_t)eth_0_MAC_ADDR1;
+      mac_address[2] = (uint8_t)eth_0_MAC_ADDR2;
+      mac_address[3] = (uint8_t)eth_0_MAC_ADDR3;
+      mac_address[4] = (uint8_t)eth_0_MAC_ADDR4;
+      mac_address[5] = (uint8_t)eth_0_MAC_ADDR5;
 #endif
-         printf ("Successfully connected to Ethernet.\n");
-
-         // cy_ecm_set_promiscuous_mode(ecm_handle, true);
-         cy_ecm_broadcast_disable (ecm_handle, false);
-         break;
-      }
    }
+   else
+   {
+#if (defined (eth_1_ENABLED) && (eth_1_ENABLED == 1u))
+      mac_address[0] = (uint8_t)eth_1_MAC_ADDR0;
+      mac_address[1] = (uint8_t)eth_1_MAC_ADDR1;
+      mac_address[2] = (uint8_t)eth_1_MAC_ADDR2;
+      mac_address[3] = (uint8_t)eth_1_MAC_ADDR3;
+      mac_address[4] = (uint8_t)eth_1_MAC_ADDR4;
+      mac_address[5] = (uint8_t)eth_1_MAC_ADDR5;
+#endif
+   }
+
+   ip_addr.addr.version = CY_ECM_IP_VER_V4;
+   ip_addr.addr.ip.v4 = db_get_network_ipaddr();
+   ip_addr.gateway.version = CY_ECM_IP_VER_V4;
+   ip_addr.gateway.ip.v4 = db_get_network_gateway();
+   ip_addr.netmask.version = CY_ECM_IP_VER_V4;
+   ip_addr.netmask.ip.v4 = db_get_network_netmask();
+
+   cy_network_add_nw_interface (
+      CY_NETWORK_ETH_INTERFACE,
+      INTERFACE_ID,
+      (INTERFACE_ID == CY_ECM_INTERFACE_ETH1) ? ETH1 : ETH0,
+      mac_address,
+      db_get_network_dhcp() ? NULL : &ip_addr,
+      &iface
+   );
+
+#if LWIP_NETIF_HOSTNAME
+   struct netif * netif = (struct netif *)iface->nw_interface;
+   netif->hostname = db_get_network_hostname();
+#endif
+
+#if LWIP_DNS
+   ip_addr_t nameserver = IPADDR4_INIT (db_get_network_nameserver());
+   dns_setserver (0, &nameserver);
+#endif
+
+   /* Register to receive netif status changes  */
+   cy_network_register_ip_change_cb (iface, iface_status_cb, NULL);
+
+   /* Register to receive link changes  */
+   cy_ecm_register_event_callback (ecm_handle, ecm_link_cb);
 
    return result;
 }
-
-/**
- * Read the MAC address from a file.
- * If the file does not exist or is not valid, the MAC address is set to 0.
- *
- * @param mac_address MAC address buffer to write to
- */
-/*
-static void read_mac_from_file (cy_ecm_mac_t * mac_address)
-{
-  int n_bytes;
-  RTE_FILE * f = rte_fs_fopen (mac_file, "r");
-
-  if (f < 0)
-  {
-     return;
-  }
-  n_bytes = rte_fs_fread (mac_address, 1, 6, f);
-  if (n_bytes != 6)
-  {
-     memset (mac_address, 0, 6);
-  }
-  rte_fs_fclose (f);
-}
-*/
-
-/**
- * Convert a string to a MAC address.
- * Avoids using sscanf.
- *
- * @param str MAC address string in format XX:XX:XX:XX:XX:XX
- * @param mac MAC address buffer to write to
- * @return 0 on success, -1 on error
- */
-int str2mac (const char * str, cy_ecm_mac_t mac)
-{
-   if (
-      strlen (str) != 17 || str[2] != ':' || str[5] != ':' || str[8] != ':' ||
-      str[11] != ':' || str[14] != ':')
-   {
-      return -1;
-   }
-
-   for (int i = 0; i < 6; i++)
-   {
-      char byte_str[3] = {str[i * 3], str[i * 3 + 1], '\0'};
-      char * endptr;
-      mac[i] = (uint8_t)strtol (byte_str, &endptr, 16);
-      if (*endptr != '\0')
-      {
-         return -1;
-      }
-   }
-
-   return 0;
-}
-
-/*
- * disabled until infineon adds back method of updating mac address in runtime
- * currently mac address is hardcoded via device configurator and cannot be changed
- * without modifying ethernet-connection-manager component
- */
-#if 0
-int _cmd_mac (int argc, char * argv[])
-{
-   cy_ecm_mac_t mac_address;
-   RTE_FILE * f;
-   int n_bytes;
-
-   if (argc == 1)
-   {
-      f = rte_fs_fopen (mac_file, "r");
-      if (f < 0)
-      {
-         printf ("No MAC address file. Default MAC address (00:03:19:45:00:00) "
-                 "is used\n");
-         return 0;
-      }
-
-      n_bytes = rte_fs_fread (mac_address, 1, sizeof (mac_address), f);
-      rte_fs_fclose (f);
-
-      if (n_bytes != sizeof (mac_address))
-      {
-         printf (
-            "Unexpected data in MAC address file. File will be deleted.\n");
-         rte_fs_remove (mac_file);
-         return 0;
-      }
-
-      printf (
-         "MAC address: %02X:%02X:%02X:%02X:%02X:%02X\n",
-         mac_address[0],
-         mac_address[1],
-         mac_address[2],
-         mac_address[3],
-         mac_address[4],
-         mac_address[5]);
-   }
-   else if (argc == 2)
-   {
-      if (str2mac (argv[1], mac_address) != 0)
-      {
-         printf ("Error: Invalid MAC address format\n");
-         return -1;
-      }
-
-      f = rte_fs_fopen (mac_file, "w");
-      if (f < 0)
-      {
-         printf ("Error: Could not open file %s\n", mac_file);
-         return 0;
-      }
-
-      n_bytes = rte_fs_fwrite (mac_address, 1, sizeof (mac_address), f);
-      rte_fs_fclose (f);
-
-      if (n_bytes != sizeof (mac_address))
-      {
-         printf ("Error: Could not write MAC address to file\n");
-         return 0;
-      }
-
-      printf ("Ok, MAC address written to file\n");
-   }
-   else
-   {
-      printf ("Usage: mac [<MAC address>]\n");
-      return -1;
-   }
-
-   return 0;
-}
-
-const shell_cmd_t cmd_mac = {
-   .cmd = _cmd_mac,
-   .name = "mac",
-   .help_short = "read/write MAC address",
-   .help_long =
-      "Read or write the MAC address to file.\n"
-      "Usage: mac [<MAC address>]\n"
-      "If no MAC address is given, the current MAC address is shown.\n"
-      "The MAC address should be in the format XX:XX:XX:XX:XX:XX."};
-
-SHELL_CMD (cmd_mac);
-#endif
-
-static void show_lwip_netconfig (struct netif * netif)
-{
-   ip_addr_t ip_addr = netif->ip_addr;
-   ip_addr_t netmask = netif->netmask;
-   ip_addr_t gw = netif->gw;
-
-   if (netif == NULL)
-   {
-      printf ("network interface not initialized\n");
-      return;
-   }
-
-   /* assume only one adapter (0) */
-   printf ("\n[%s0] : \n", netif->name);
-
-   printf (
-      "  mac address : %02x:%02x:%02x:%02x:%02x:%02x\n",
-      netif->hwaddr[0],
-      netif->hwaddr[1],
-      netif->hwaddr[2],
-      netif->hwaddr[3],
-      netif->hwaddr[4],
-      netif->hwaddr[5]);
-
-   printf ("  ipaddress   : %s\n", ipaddr_ntoa (&ip_addr));
-   printf ("  netmask     : %s\n", ipaddr_ntoa (&netmask));
-   printf ("  gateway     : %s\n", ipaddr_ntoa (&gw));
-
-   if (netif->hostname)
-      printf ("  hostname    : %s\n", netif->hostname);
-   else
-      printf ("  hostname    : not set\n");
-
-   printf (
-      "  dhcp        : %s\n",
-      dhcp_is_enabled (netif) ? "enabled" : "disabled");
-}
-
-int netcfg_set (
-   struct netif * netif,
-   const char * ip_str,
-   const char * netmask_str,
-   const char * gw_str,
-   const char * hostname)
-{
-   ip4_addr_t ipaddr;
-   ip4_addr_t netmask;
-   ip4_addr_t gw;
-
-   if (ip_str)
-   {
-      if (!ip4addr_aton (ip_str, &ipaddr))
-         printf ("Invalid IP address format: %s\n", ip_str);
-      else
-         netif_set_ipaddr (netif, &ipaddr);
-      return -1;
-   }
-
-   if (netmask_str)
-   {
-      if (!ip4addr_aton (netmask_str, &netmask))
-         printf ("Invalid netmask format: %s\n", netmask_str);
-      else
-         netif_set_netmask (netif, &netmask);
-      return -1;
-   }
-
-   if (gw_str)
-   {
-      if (!ip4addr_aton (gw_str, &gw))
-         printf ("Invalid gateway address format: %s\n", gw_str);
-      else
-         netif_set_gw (netif, &gw);
-      return -1;
-   }
-
-   if (hostname && netif)
-   {
-      /* need static area for name */
-      strcpy (net_hostname, hostname);
-      netif->hostname = net_hostname;
-   }
-
-   return 0;
-}
-
-int _netcfg_cmd (int argc, char * argv[])
-{
-   int i;
-   const char * hostname = NULL;
-   const char * local_ip = NULL;
-   const char * netmask = NULL;
-   const char * gw = NULL;
-   const char * dhcp = NULL;
-
-   if (netif_default == NULL)
-   {
-      printf ("network interface not initialized, please insert network cable\n");
-      return 0;
-   }
-
-   if (argc < 2)
-   {
-      show_lwip_netconfig (netif_default);
-      return 0;
-   }
-
-   for (i = 1; i < argc; i++)
-   {
-      if (i + 1 >= argc)
-      {
-         printf ("missing value for option: %s\n", argv[i]);
-         return -1;
-      }
-
-      if (strcmp (argv[i], "hostname") == 0)
-      {
-         hostname = argv[++i];
-      }
-      else if (strcmp (argv[i], "ip") == 0)
-      {
-         local_ip = argv[++i];
-      }
-      else if (strcmp (argv[i], "mask") == 0)
-      {
-         netmask = argv[++i];
-      }
-      else if (strcmp (argv[i], "gw") == 0)
-      {
-         gw = argv[++i];
-      }
-      else if (strcmp (argv[i], "dhcp") == 0)
-      {
-         dhcp = argv[++i];
-      }
-      else
-      {
-         printf ("netcfg : unknown option: %s\n", argv[i]);
-         return -1;
-      }
-   }
-
-   if (dhcp)
-   {
-      if (strncmp (dhcp, "on", 2) == 0)
-      {
-         dhcp_set (netif_default, true);
-      }
-      else
-      {
-         dhcp_set (netif_default, false);
-      }
-   }
-   else
-   {
-      netcfg_set (netif_default, local_ip, netmask, gw, hostname);
-   }
-
-   return 0;
-}
-
-const shell_cmd_t netcfg_cmd = {
-   .cmd = _netcfg_cmd,
-   .name = "netcfg",
-   .help_short = "configure network parameters",
-   .help_long = "\nnetcfg\n"
-                "                           -- show current config\n"
-                "   ip <addr>               -- set local ip addr\n"
-                "   mask <mask>             -- set netmask\n"
-                "   gw <addr>               -- set gateway addr\n"
-                "   hostname <name>         -- set local hostname\n"
-                "   dhcp <on/off>           -- enable / disable dhcp\n"
-                "\n"
-                "Example : \n"
-                "   netcfg ip 10.10.0.25 mask 255.255.255.0 gw 10.10.0.1\n"};
-
-SHELL_CMD (netcfg_cmd);
